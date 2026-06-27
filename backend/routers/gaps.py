@@ -1,66 +1,66 @@
-from fastapi import APIRouter, HTTPException
-from services.gemini_service import generate_dashboard_report
+from fastapi import APIRouter
 from database import get_db
 
-router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+router = APIRouter(prefix="/gaps", tags=["gap-map"])
 
 
-@router.get("/{phone}")
-async def get_dashboard(phone: str):
-    """
-    Owner dashboard — weekly metrics + AI-generated report.
-    """
+@router.get("/{area}")
+async def get_area_gaps(area: str):
     db = get_db()
 
-    shop = db.table("shops").select("*").eq("phone", phone).single().execute()
-    if not shop.data:
-        raise HTTPException(status_code=404, detail="Shop not found")
-
-    shop_data = shop.data
-
-    # Count reviews this week
-    reviews = db.table("reviews") \
-        .select("rating") \
-        .eq("shop_id", shop_data["id"]) \
+    gaps = db.table("demand_gaps") \
+        .select("*") \
+        .eq("area", area) \
+        .order("gap_score", desc=True) \
+        .limit(10) \
         .execute()
 
-    ratings = [r["rating"] for r in reviews.data] if reviews.data else []
-    avg_rating = sum(ratings) / len(ratings) if ratings else 0
+    return {"area": area, "gaps": gaps.data or []}
 
-    # Count nearby competitors
-    competitors = db.rpc("nearby_shops", {
-        "search_lat": shop_data["lat"],
-        "search_lng": shop_data["lng"],
-        "radius_meters": 1000,
-        "category_filter": shop_data["category"],
-        "keyword_filter": [],
-    }).execute()
 
-    competitor_count = len(competitors.data or []) - 1  # exclude self
+@router.post("/recompute/{area}")
+async def recompute_gaps(area: str):
+    db = get_db()
 
-    metrics = {
-        "profile_views": shop_data.get("profile_views", 0),
-        "direction_clicks": 0,           # TODO: track separately
-        "search_appearances": 0,         # TODO: join with search_logs
-        "new_reviews": len(ratings),
-        "avg_rating": round(avg_rating, 1),
-        "competitor_count": max(0, competitor_count),
-    }
+    logs = db.table("search_logs") \
+        .select("detected_category") \
+        .eq("area", area) \
+        .eq("results_found", 0) \
+        .execute()
 
-    # AI weekly report
-    ai_report = generate_dashboard_report(shop_data, metrics)
+    if not logs.data:
+        return {"message": "No gap data to compute"}
 
-    return {
-        "shop": {
-            "id": shop_data["id"],
-            "shop_name": shop_data["shop_name"],
-            "category": shop_data["category"],
-            "area": shop_data["area"],
-            "is_open": shop_data["is_open"],
-            "status": shop_data["status"],
-            "today_special": shop_data.get("today_special"),
-            "verified": shop_data["verified"],
-        },
-        "metrics": metrics,
-        "ai_report": ai_report,
-    }
+    from collections import Counter
+    category_counts = Counter(
+        log["detected_category"] for log in logs.data
+        if log["detected_category"]
+    )
+
+    shops = db.table("shops").select("category").eq("area", area).execute()
+    shop_counts = Counter(s["category"] for s in shops.data)
+
+    for category, search_count in category_counts.items():
+        shop_count = shop_counts.get(category, 0)
+        gap_score = search_count / max(shop_count, 1)
+
+        db.table("demand_gaps").upsert({
+            "area": area,
+            "category": category,
+            "search_count": search_count,
+            "shop_count": shop_count,
+            "gap_score": gap_score,
+        }, on_conflict="area,category").execute()
+
+    return {"message": f"Recomputed gaps for {area}", "categories": len(category_counts)}
+
+
+@router.get("/city/heatmap")
+async def city_heatmap():
+    db = get_db()
+    gaps = db.table("demand_gaps") \
+        .select("area, category, gap_score, search_count, shop_count") \
+        .order("gap_score", desc=True) \
+        .execute()
+
+    return {"heatmap": gaps.data or []}
